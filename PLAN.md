@@ -72,14 +72,14 @@ terraform show -json  ┐                        ┌─ pricing (forecast) ┐
 sharing:  core (lib) ─linked by─► cli (bin) & server (bin);  web/ (TS) → server API
 ```
 
-## Delivery: git-town stack (local for now; PRs once a remote is added)
+## Delivery: git-town stack (stacked PRs; remote `OrHayat/costctl`, trunk `master`)
 
 Built as a **stack of branches** — each a child of the one below, each an independently
 reviewable PR that compiles and passes tests on its own. A crate is introduced **only on the
 branch that implements it**, so there are **no stub binaries** anywhere.
 
 ```
-main             clean baseline: PLAN.md + .gitignore
+master           clean baseline: PLAN.md + .gitignore
 └─ 01-core-ir    workspace (core lib only) + IR model            [Steps 0–1]
    └─ 02-tf-parser   terraform plan parser + golden fixture      [Step 2]
       └─ 03-pricing  Pricer trait + SqlitePricer + seed DB       [Step 3]
@@ -101,7 +101,7 @@ Each step is independently buildable and has a **Done** bar; the stack above map
 branches. Steps 0–8 = v1. Tier 2/3 after.
 
 ### Step 0 — Repo + workspace (folded into branch `01-core-ir`)
-- `git init`; Rust `.gitignore` (`/target`); `PLAN.md` committed to `main` as the stack baseline.
+- `git init`; Rust `.gitignore` (`/target`); `PLAN.md` committed to `master` as the stack baseline.
 - Cargo **workspace with only the `core` library crate** — *no* `cli`/`fetcher` stub binaries
   (those are added on their own branches at Steps 6–7). Deps used by `core`:
   `serde`/`serde_json`, `rusqlite` (`bundled`), `anyhow`/`thiserror`.
