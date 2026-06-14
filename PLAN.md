@@ -1,4 +1,4 @@
-# Plan: `tfcost` — a cost-aware infrastructure tool (CLI → platform)
+# Plan: `costctl` — a cost-aware infrastructure tool (CLI → platform)
 
 ## Context
 
@@ -38,6 +38,10 @@ Tier 3        PLATFORM          env orchestration, scheduler, web UI,   needs a 
   never fabricate). Optional `usage.yml` is Phase 2.
 - **Attribution: tag-based** — IaC stamps a stack/owner tag; billing grouped by tag + usage-type.
 - **Input:** Terraform plan JSON first, behind a normalized IR so Pulumi/CFN are later adapters.
+- **Terraform compatibility:** accept plan `format_version` **1.x** (Terraform 1.1+); reject other
+  JSON as "not a plan." Unknown fields are ignored (forward-compatible within 1.x). The binary
+  `.tfplan` from `-out` is an internal/unstable format — never parsed directly.
+- **HCL:** out of v1 — a future second adapter (no-plan-needed, best-effort eval, less accurate).
 
 ## Research findings (validated, with sources)
 
@@ -65,7 +69,7 @@ Tier 3        PLATFORM          env orchestration, scheduler, web UI,   needs a 
 ## Architecture
 
 ```
-frontends                 normalized IR            analysis            backends
+adapters                  normalized IR            analysis            renderers
 terraform show -json  ┐                        ┌─ pricing (forecast) ┐
 (pulumi/cfn later)    ┼──►  ResourceChange ────┼─ billing  (track)   ┼──► text / JSON / (TUI)
                       ┘     (canonical enum)   └─ reconcile (drift)  ┘
@@ -105,14 +109,14 @@ branches. Steps 0–8 = v1. Tier 2/3 after.
 - Cargo **workspace with only the `core` library crate** — *no* `cli`/`fetcher` stub binaries
   (those are added on their own branches at Steps 6–7). Deps used by `core`:
   `serde`/`serde_json`, `rusqlite` (`bundled`), `anyhow`/`thiserror`.
-- **Done:** `cargo build -p tfcost-core` compiles (verified together with Step 1).
+- **Done:** `cargo build -p costctl-core` compiles (verified together with Step 1).
 
 ### Step 1 — IR model (`core/src/ir.rs`)
 - `ResourceChange { address, rtype, name, action, before, after }`; `Action` enum
   (Create/Update/Delete/Replace/NoOp); `SpecState` selector (before vs after).
 - **Done:** types compile; a unit test constructs each `Action`.
 
-### Step 2 — Terraform frontend (`core/src/frontend/terraform.rs`)
+### Step 2 — Terraform parser (`core/src/adapters/terraform.rs`)
 - serde structs for the *subset* of `terraform show -json`: `resource_changes[].{type, name,
   address, mode, change{actions, before, after, after_unknown}}`. `parse_plan(reader) ->
   Vec<ResourceChange>`.
@@ -120,6 +124,8 @@ branches. Steps 0–8 = v1. Tier 2/3 after.
   `["create","delete"]`/`["delete","create"]`→Replace, `["no-op"]`/`["read"]`→skip. Filter
   `mode == "managed"`. Pick attrs from `after` (create/update/replace) or `before` (delete);
   if a cost-relevant attr appears in `after_unknown`, flag it unknown for "not estimated".
+- Validate it's a plan: require `format_version` (else "not a plan"); accept major **1.x** only.
+- Compat-matrix test: real plans from Terraform 1.1.9 / 1.5.7 / 1.9.8 (format_version 1.0–1.2) all parse.
 - Generate a **real** plan and commit it as `testdata/sample-plan.json` (see Verification).
 - **Done:** golden test parses the fixture, incl. a Replace and a computed-unknown attribute.
 
@@ -140,11 +146,13 @@ branches. Steps 0–8 = v1. Tier 2/3 after.
 - **Done:** text output matches the mock on the fixture; JSON validates.
 
 ### Step 6 — CLI wiring — adds the `cli` crate (branch `06-cli`)
-- Add the `cli` crate as a workspace member (bin name `tfcost`) — the first binary, fully wired.
+- Add the `cli` crate as a workspace member (bin name `costctl`) — the first binary, fully wired.
+- Accept the plan JSON directly; also accept a `.tfplan` by shelling out to
+  `terraform show -json` internally (needs `terraform` on PATH).
 - clap: positional `plan.json` or stdin; flags `--json`, `--budget N`, `--no-color`,
   `--offline`. Pipeline: parse → compute → render → budget check. Exit: 0 ok / 1 error /
   2 budget exceeded.
-- **Done:** `tfcost plan.json` prints the report on the *real* generated plan; `--budget`
+- **Done:** `costctl plan.json` prints the report on the *real* generated plan; `--budget`
   exits non-zero.
 
 ### Step 7 — Price DB fetcher + refresh — adds the `fetcher` crate (branch `07-fetcher`)
@@ -166,7 +174,7 @@ branches. Steps 0–8 = v1. Tier 2/3 after.
 ## UX (the target for Step 5)
 
 ```
-tfcost: forecast for plan.json  (prices: aws/us-east-1, db 2026-06-10)
+costctl: forecast for plan.json  (prices: aws/us-east-1, db 2026-06-10)
 
   CHANGE                       DETAIL              Δ MONTHLY
   + aws_instance.web (×3)      t3.large            +$190.46
@@ -181,7 +189,7 @@ Honest-by-design: variable costs show the *unit rate*, never a fabricated total.
 
 ## Verification (end to end, used by Steps 2 & 6)
 ```
-mkdir -p /tmp/tfcost-demo && cd /tmp/tfcost-demo
+mkdir -p /tmp/costctl-demo && cd /tmp/costctl-demo
 cat > main.tf <<'EOF'
 provider "aws" { region = "us-east-1" }
 resource "aws_instance" "web" { count = 3  ami = "ami-000"  instance_type = "t3.large" }
@@ -191,9 +199,9 @@ terraform init -backend=false
 terraform plan -out plan.tfplan -refresh=false
 terraform show -json plan.tfplan > plan.json
 ```
-Run `tfcost plan.json`; confirm totals vs a hand calc (t3.large ≈ $0.0832/hr × 730 × 3 +
+Run `costctl plan.json`; confirm totals vs a hand calc (t3.large ≈ $0.0832/hr × 730 × 3 +
 NAT $0.045/hr × 730). Copy `plan.json` → `testdata/sample-plan.json` as the golden fixture.
-`tfcost --budget 100 plan.json; echo $?` → report + non-zero exit.
+`costctl --budget 100 plan.json; echo $?` → report + non-zero exit.
 
 ## Roadmap (post-v1, coarse steps)
 - **Tier 2 — Track:** parse `terraform show -json` of *state* for inventory; query Cost
@@ -203,3 +211,5 @@ NAT $0.045/hr × 730). Copy `plan.json` → `testdata/sample-plan.json` as the g
 - **Tier 3 — Platform:** `server` crate (axum + sqlx) over the same `core`; env/stack
   orchestration (wraps apply/destroy); **scheduler** (timed spin-up/tear-down = the biggest
   cost lever); web UI (TS/React) dashboards; RBAC/ACL; Pulumi/CFN IR adapters.
+- **More adapters:** HCL (no-plan-needed, best-effort var/module eval — can't tell create vs
+  replace without state, so less accurate than plan JSON); Pulumi `preview --json`; CloudFormation.

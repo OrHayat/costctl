@@ -79,12 +79,26 @@ impl ResourceChange {
     }
 
     /// True if `key`'s value is computed and won't be known until the change is applied,
-    /// so it can't be priced.
+    /// so it can't be priced. Handles nested unknowns: Terraform mirrors structure in
+    /// `after_unknown`, so a partially-computed object/array attribute is flagged when *any*
+    /// leaf inside it is unknown — not just when the whole value is the scalar `true`.
     pub fn is_unknown(&self, key: &str) -> bool {
-        matches!(
-            self.after_unknown.as_ref().and_then(|u| u.get(key)),
-            Some(Value::Bool(true))
-        )
+        self.after_unknown
+            .as_ref()
+            .and_then(|u| u.get(key))
+            .is_some_and(contains_unknown)
+    }
+}
+
+/// Recursively detect an unknown leaf in an `after_unknown` value. Terraform encodes a scalar
+/// unknown as `true` and a nested unknown as the surrounding object/array with `true` at the
+/// computed leaves (known leaves are omitted entirely).
+fn contains_unknown(value: &Value) -> bool {
+    match value {
+        Value::Bool(b) => *b,
+        Value::Array(items) => items.iter().any(contains_unknown),
+        Value::Object(map) => map.values().any(contains_unknown),
+        _ => false,
     }
 }
 
