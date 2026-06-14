@@ -8,3 +8,4 @@
 //! - `report`    — render text / JSON output              (05-report)
 
 pub mod ir;
+pub mod adapters;

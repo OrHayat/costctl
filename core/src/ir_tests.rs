@@ -46,3 +46,23 @@ fn unknown_after_values_are_flagged() {
     assert!(rc.is_unknown("instance_type"));
     assert!(!rc.is_unknown("ami"));
 }
+
+#[test]
+fn nested_unknown_values_are_flagged() {
+    let rc = ResourceChange {
+        address: "aws_instance.web".into(),
+        rtype: "aws_instance".into(),
+        name: "web".into(),
+        action: Action::Create,
+        before: None,
+        after: Some(attrs(&[("root_block_device", json!([{}]))])),
+        after_unknown: Some(attrs(&[
+            // a computed leaf nested inside a list/object
+            ("root_block_device", json!([{ "volume_id": true }])),
+            ("ebs_optimized", json!(false)),
+        ])),
+    };
+    assert!(rc.is_unknown("root_block_device")); // unknown leaf nested in a list/object
+    assert!(!rc.is_unknown("ebs_optimized")); // known scalar
+    assert!(!rc.is_unknown("absent")); // not present in after_unknown
+}
