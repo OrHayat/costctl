@@ -30,8 +30,10 @@ Tier 3        PLATFORM          env orchestration, scheduler, web UI,   needs a 
   v1 is AWS-only (AWS Rust SDK is solid), Azure/GCP billing+pricing are plain REST via
   `reqwest`, orchestration shells out to `terraform`/`pulumi`. Accepted cost: Rust async
   server (tokio/axum) is heavier to learn / slower to compile.
-- **Prices:** periodic maintainer-run fetcher → hosted, versioned **SQLite** price DB →
-  client downloads/caches, runs **offline, no user token**; checksummed + bundled fallback.
+- **Prices:** periodic maintainer-run fetcher → hosted, versioned **flat-file catalog**
+  (a serialized map, bincode + zstd) → client downloads/caches, runs **offline, no user
+  token**; checksummed + bundled fallback. Not a DB: the catalog is small and read-only and
+  lookups are pure point queries — a `Pricer` trait is the swap point if it outgrows RAM.
 - **Tracking uses the user's own cloud creds** (actual spend is their private bill). Cost
   Explorer for finalized actuals (~24h lag) + optional CloudWatch live estimate, labeled.
 - **Usage-based costs:** v1 = split report (fixed $ + unit rate, flag the variable part;
@@ -56,15 +58,16 @@ Tier 3        PLATFORM          env orchestration, scheduler, web UI,   needs a 
 - **AWS prices are public, no creds** ([bulk API docs](https://docs.aws.amazon.com/awsaccountbilling/latest/aboutv2/finding-prices-in-service-price-list-files.html)):
   offer files = `products[SKU].attributes` (instanceType, location, OS, tenancy…) + `terms.OnDemand[SKU][term].priceDimensions[dim].pricePerUnit.USD`. The global EC2 file is multi-GB,
   but **per-region** files (`…/AmazonEC2/current/us-east-1/index.json`) are far smaller — the
-  fetcher distills these into the compact SQLite snapshot.
+  fetcher distills these into the compact serialized catalog snapshot.
 - **Azure Retail Prices API is public/unauthenticated** ([MS docs](https://learn.microsoft.com/en-us/rest/api/cost-management/retail-prices/azure-retail-prices)) — `https://prices.azure.com/api/retail/prices`, OData filters. Proves the live-fetch path for a future provider.
 - **Prior art — Infracost** ([cloud pricing API](https://www.infracost.io/docs/supported_resources/cloud_pricing_api/)):
   same model (parse plan → look up prices; never sends the plan or creds), but relies on a
   hosted GraphQL pricing **server** (10M+ prices, weekly job). **Our differentiator:** an
-  offline, self-contained SQLite snapshot (no server) + the Track/Reconcile/platform tiers.
-- **rusqlite `bundled`** ([crate](https://crates.io/crates/rusqlite)) compiles SQLite into the
-  binary with pregenerated bindings (no bindgen at build) — ship the DB beside the binary,
-  users need nothing installed.
+  offline, self-contained catalog snapshot (no server) + the Track/Reconcile/platform tiers.
+- **Storage = flat-file map, not a DB.** The catalog is read-only and small (v1 = an AWS
+  subset), accessed by exact-key point lookups — no joins, ranges, or concurrency. A
+  serialized map loaded into a `HashMap` needs no extra dependency and ships as one file.
+  SQLite / embedded-KV stay behind the `Pricer` trait as the "if it outgrows RAM" backend.
 
 ## Architecture
 
@@ -86,7 +89,7 @@ branch that implements it**, so there are **no stub binaries** anywhere.
 master           clean baseline: PLAN.md + .gitignore
 └─ 01-core-ir    workspace (core lib only) + IR model            [Steps 0–1]
    └─ 02-tf-parser   terraform plan parser + golden fixture      [Step 2]
-      └─ 03-pricing  Pricer trait + SqlitePricer + seed DB       [Step 3]
+      └─ 03-pricing  Pricer trait + MapPricer (in-mem catalog)   [Step 3]
          └─ 04-cost  cost diff engine                            [Step 4]
             └─ 05-report  text + JSON renderers                  [Step 5]
                └─ 06-cli     add cli crate — real wiring         [Step 6]
@@ -108,7 +111,8 @@ branches. Steps 0–8 = v1. Tier 2/3 after.
 - `git init`; Rust `.gitignore` (`/target`); `PLAN.md` committed to `master` as the stack baseline.
 - Cargo **workspace with only the `core` library crate** — *no* `cli`/`fetcher` stub binaries
   (those are added on their own branches at Steps 6–7). Deps used by `core`:
-  `serde`/`serde_json`, `rusqlite` (`bundled`), `anyhow`/`thiserror`.
+  `serde`/`serde_json`, `thiserror` (no `rusqlite` — pricing is a flat-file map; `anyhow`
+  lands with the `cli`).
 - **Done:** `cargo build -p costctl-core` compiles (verified together with Step 1).
 
 ### Step 1 — IR model (`core/src/ir.rs`)
@@ -129,11 +133,15 @@ branches. Steps 0–8 = v1. Tier 2/3 after.
 - Generate a **real** plan and commit it as `testdata/sample-plan.json` (see Verification).
 - **Done:** golden test parses the fixture, incl. a Replace and a computed-unknown attribute.
 
-### Step 3 — Pricing read path + seed DB (`core/src/pricing/`)
-- `db.rs`: open + query a local SQLite price DB; for dev, build a tiny seeded DB from a
-  committed `.sql` at test time. `pricer.rs`: `Pricer` trait + `SqlitePricer` mapping
-  (resource type + attrs) → `(Money, Breakdown{fixed, unit_rate}, found: bool)`.
-- **Done:** unit test prices `aws_instance`=t3.large; returns "unknown" for an unpriced type.
+### Step 3 — Pricing read path (`core/src/pricing.rs`)
+- `Pricer` trait: `price(rtype, &attrs) -> Option<Price>` (`None` = unpriced). `MapPricer`
+  holds the catalog in memory, keyed by `(type, region, sku)`, built for a fixed region;
+  `sku_key_for` picks the per-type discriminator (EC2→`instance_type`, RDS→`instance_class`,
+  NAT→none). `Price { fixed_monthly, usage: Option<UsageRate> }` — variable costs as a unit
+  rate, never fabricated. `PriceRow` derives serde for the Step-7 artifact.
+- Real catalog is distilled by the fetcher (Step 7); the dev test builds an inline catalog
+  (no seed file). Unknown/computed attrs are the cost engine's concern, not the pricer's.
+- **Done:** unit test prices `aws_instance`=t3.large; returns `None` for an unmodeled type.
 
 ### Step 4 — Cost diff engine (`core/src/cost.rs`)
 - `compute(changes, &dyn Pricer) -> Report { lines, net_monthly, not_estimated }`; signed
@@ -155,14 +163,17 @@ branches. Steps 0–8 = v1. Tier 2/3 after.
 - **Done:** `costctl plan.json` prints the report on the *real* generated plan; `--budget`
   exits non-zero.
 
-### Step 7 — Price DB fetcher + refresh — adds the `fetcher` crate (branch `07-fetcher`)
+### Step 7 — Price catalog fetcher + refresh — adds the `fetcher` crate (branch `07-fetcher`)
 - `fetcher/`: download AWS **per-region** offer files (e.g.
   `…/AmazonEC2/current/us-east-1/index.json` — far smaller than the multi-GB global file),
   walk `products[SKU].attributes` → `terms.OnDemand[SKU][…].priceDimensions[…].pricePerUnit.USD`,
-  and distill into a compact date-versioned SQLite DB + checksum.
-- `core/pricing/db.rs`: runtime download → cache dir → verify checksum → fall back to bundled
-  snapshot → warn if stale; `--offline` skips refresh.
-- **Done:** fetcher emits a DB the CLI consumes; offline run uses the bundled fallback.
+  convert hourly → monthly (×730), and distill into a compact date-versioned catalog
+  (serialized `PriceRow`s, bincode + zstd) + a small manifest carrying the sha256.
+- Catalog loader in `core`: refresh only past a TTL (~24h), `ETag`/`304` so the unchanged
+  case is ~0 bytes; on change, verify checksum → atomic swap into the cache dir; fall back to
+  the bundled snapshot, warn if stale; `--offline` skips refresh. Per-region files keep
+  transfers small; a CDN + immutable per-version files absorb the client fan-out.
+- **Done:** fetcher emits a catalog the CLI loads; offline run uses the bundled fallback.
 
 ### Step 8 — Polish + README
 - README: usage + the honest "what it can / can't estimate" boundary (fixed vs usage-based).
