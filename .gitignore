@@ -1,1 +1,10 @@
 /target
+.claude/
+
+# Terraform working files — examples keep only main.tf + plan.json
+**/.terraform/
+**/.terraform.lock.hcl
+*.tfplan
+*.tfstate
+*.tfstate.*
+crash.log
