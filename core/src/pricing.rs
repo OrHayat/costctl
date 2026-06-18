@@ -90,6 +90,18 @@ impl Pricer for MapPricer {
     }
 }
 
+/// The attribute keys whose values determine a resource type's price. If any of these is
+/// computed-unknown in a plan, the spec genuinely can't be priced — distinct from a type that
+/// simply isn't in the catalog. The cost engine uses this to explain *why* a change wasn't
+/// estimated. Mirrors the per-type knowledge [`sku_key_for`] keys on.
+pub fn price_keys(rtype: &str) -> &'static [&'static str] {
+    match rtype {
+        "aws_instance" => &["instance_type"],
+        "aws_db_instance" => &["instance_class"],
+        _ => &[], // NAT (no discriminator) and unmodeled types alike have none to check
+    }
+}
+
 /// Which attribute value discriminates the price for a resource type — its "sku key".
 ///
 /// `None` means the type isn't modeled (→ unpriced). `Some("")` means the type has a single
