@@ -11,3 +11,4 @@ pub mod ir;
 pub mod adapters;
 pub mod pricing;
 pub mod cost;
+pub mod report;
